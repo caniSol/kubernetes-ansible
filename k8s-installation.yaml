@@ -5,6 +5,7 @@
     control_nodes:
       - 10.0.12.30 k8s-dmz-control-0
       - 10.0.12.31 k8s-dmz-control-1
+      - 10.0.12.32 k8s-dmz-control-2
     worker_nodes:
       - 10.0.12.10 k8s-dmz-worker-0
       - 10.0.12.11 k8s-dmz-worker-1
