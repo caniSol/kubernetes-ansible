@@ -1,0 +1,493 @@
+- name: Install Kubernetes
+  hosts: k8s
+  become: true
+  vars:
+    control_nodes:
+      - 10.0.12.30 k8s-dmz-control-0
+      - 10.0.12.31 k8s-dmz-control-1
+    worker_nodes:
+      - 10.0.12.10 k8s-dmz-worker-0
+      - 10.0.12.11 k8s-dmz-worker-1
+      - 10.0.12.12 k8s-dmz-worker-2
+      - 10.0.12.100 vip.dmzcluster.local
+    master_node: "{{ control_nodes[0].split(' ')[-1] }}"
+    cri_dockerd_version: "0.4.4"
+    cri_dockerd_dl_url: "https://github.com/Mirantis/cri-dockerd/releases/download/v{{ cri_dockerd_version }}/cri-dockerd_{{ cri_dockerd_version }}.3-0.ubuntu-jammy_amd64.deb"
+    kubernetes_version: "1.37"
+    kubernetes_packages:
+      - kubelet
+      - kubeadm
+      - kubectl
+
+  tasks:
+    - name: Install prerequisites
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - python3-debian
+          - xz-utils
+          - apt-transport-https
+          - gpg
+          - qemu-guest-agent
+        state: present
+        update_cache: true
+        cache_valid_time: 36000
+
+    - name: Ensure apt keyrings directory exists
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Install Docker
+      block:
+        - name: Download Dockers official GPG key
+          ansible.builtin.get_url:
+            url: https://download.docker.com/linux/ubuntu/gpg
+            dest: /etc/apt/keyrings/docker.asc
+            owner: root
+            group: root
+            mode: "0644"
+            force: false
+
+        - name: Add Docker apt repository
+          ansible.builtin.deb822_repository:
+            name: docker
+            types: deb
+            uris: https://download.docker.com/linux/ubuntu
+            suites: "{{ ansible_facts['distribution_release'] }}"
+            components: stable
+            architectures: "{{ ansible_facts['architecture'] }}"
+            signed_by: /etc/apt/keyrings/docker.asc
+            state: present
+            enabled: true
+          register: docker_repo
+
+        - name: Update apt cache after adding the Docker repo
+          ansible.builtin.apt:
+            update_cache: true
+            cache_valid_time: 36000
+          when: docker_repo is changed
+
+        - name: Install Docker
+          ansible.builtin.apt:
+            name:
+              - docker-ce
+              - docker-ce-cli
+              - containerd.io
+              - docker-buildx-plugin
+              - docker-compose-plugin
+            state: present
+
+        - name: Ensure Docker service is enabled and running
+          ansible.builtin.service:
+            name: docker
+            state: started
+            enabled: true
+
+      rescue:
+        - ansible.builtin.debug:
+            msg: "Error installing docker"
+
+    - name: Install cri-dockerd
+      block:
+        - name: Check cri-dockerd version
+          ansible.builtin.apt:
+            name: "cri-dockerd={{cri_dockerd_version}}*"
+            state: present
+
+      rescue:
+        - ansible.builtin.apt:
+            deb: "{{ cri_dockerd_dl_url }}"
+
+    - name: Ensure host entries exist in /etc/hosts
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: '^{{ item.split(" ")[0]|regex_escape }}'
+        line: "{{ item.split(' ')[0] }}  {{ item.split(' ')[1:]|join(' ') }}"
+        state: present
+      loop: "{{ control_nodes + worker_nodes }}"
+
+    - name: Don't let hosts file be overwritten by CloudInit
+      ansible.builtin.lineinfile:
+        path: /etc/cloud/cloud.cfg.d/99-hosts.cfg
+        line: "manage_etc_hosts: false"
+        create: true
+
+    - name: Install Kubernetes
+      block:
+        - name: Download Kubernetes official GPG key
+          ansible.builtin.get_url:
+            url: https://pkgs.k8s.io/core:/stable:/v1.37/deb/Release.key
+            dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
+            owner: root
+            group: root
+            mode: "0644"
+            force: false
+
+        - name: Add Kubernetes apt repository
+          ansible.builtin.deb822_repository:
+            name: kubernetes
+            types: deb
+            uris: https://pkgs.k8s.io/core:/stable:/v1.37/deb/
+            suites: /
+            architectures: amd64
+            signed_by: /etc/apt/keyrings/kubernetes-apt-keyring.asc
+            state: present
+            enabled: true
+          register: kubernetes_repo
+
+        - name: Update apt cache after adding the Docker repo
+          ansible.builtin.apt:
+            update_cache: true
+          when: kubernetes_repo is changed
+
+        - name: Install Kubernetes
+          ansible.builtin.apt:
+            name: "{{ kubernetes_packages }}"
+            state: present
+
+        - name: hold package versions
+          ansible.builtin.dpkg_selections:
+            name: "{{ item }}"
+            selection: hold
+          loop: "{{ kubernetes_packages }}"
+
+      rescue:
+        - ansible.builtin.debug:
+            msg: "Error installing kubernetes"
+
+    - name: Prerequisites for flannel installation
+      block:
+        - name: Enable br_netfilter for current boot
+          ansible.builtin.shell: "modprobe br_netfilter"
+
+        - name: Create module file
+          ansible.builtin.file:
+            path: /etc/modules-load.d/flannel.conf
+            state: touch
+            owner: root
+            group: root
+            mode: "0755"
+
+        - name: Fill module file
+          ansible.builtin.lineinfile:
+            path: /etc/modules-load.d/flannel.conf
+            line: "br_netfilter"
+
+        - name: Create kubernetes networking file
+          ansible.builtin.file:
+            path: /etc/sysctl.d/90-kubernetes-networking.conf
+            state: touch
+            owner: root
+            group: root
+            mode: "0755"
+
+        - name: Enable forwarding
+          ansible.builtin.lineinfile:
+            path: /etc/sysctl.d/90-kubernetes-networking.conf
+            line: "net.ipv4.ip_forward = 1"
+
+        - name: Firewall
+          ansible.builtin.lineinfile:
+            path: /etc/sysctl.d/90-kubernetes-networking.conf
+            line: "net.bridge.bridge-nf-call-iptables = 1"
+
+    - name: Ensure kube config directory exists
+      ansible.builtin.file:
+        path: /home/ansible/.kube
+        state: directory
+        owner: ansible
+        group: ansible
+        mode: "0755"
+
+
+- name: Prepare Control Nodes
+  hosts: control:master
+  become: true
+  vars:
+    ha_hosts: "{{ dict(ansible_play_hosts_all |
+                      zip(ansible_play_hosts_all |
+                          map('extract', hostvars, 'ansible_host'))) }}" # extracts hostname:ip of all hosts this applies to
+    new_directories:
+      - "/etc/keepalived"
+      - "/etc/haproxy"
+      - "/etc/kubernetes/manifests"
+    manifests:
+      - "keepalived.yaml"
+      - "haproxy.yaml"
+    INTERFACE: 'eth0'
+    ROUTER_ID: 51
+    AUTH_PASS: "{{ auth_pass }}"
+    APISERVER_VIP: '10.0.12.100'
+    APISERVER_DEST_PORT: 8443
+    APISERVER_SRC_PORT: 6443
+    STATE:
+      master: MASTER
+      control: BACKUP
+    PRIORITY:
+      master: 101
+      control: 100
+
+  tasks:
+    - name: Create new directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop: "{{ new_directories }}"
+
+    - name: Create haproxy config
+      ansible.builtin.template:
+        src: k8s/haproxy.cfg
+        dest: /etc/haproxy/haproxy.cfg
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Create keepalived config
+      ansible.builtin.template:
+        src: k8s/keepalived.conf.j2
+        dest: /etc/keepalived/keepalived.conf
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Create keepalived healthcheck
+      ansible.builtin.template:
+        src: k8s/check_apiserver.sh
+        dest: /etc/keepalived/check_apiserver.sh
+        owner: root
+        group: root
+        mode: "0744"
+
+    - name: Create kubernetes manifests
+      ansible.builtin.copy:
+        src: "k8s/{{ item }}"
+        dest: "/etc/kubernetes/manifests/{{ item }}"
+        owner: root
+        group: root
+        mode: "0600"
+      loop: "{{ manifests }}"
+
+    - name: Fill healthcheck configuration
+      ansible.builtin.lineinfile:
+        path: /etc/haproxy/haproxy.cfg
+        line: "    server {{ item.key }} {{ item.value }}:{{ APISERVER_SRC_PORT }} check verify none"
+      with_dict: "{{ ha_hosts }}"
+
+
+- name: Initiate Cluster
+  hosts: master
+  vars:
+    pod_network_cidr: "10.244.0.0/16"
+    network_addon: "https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml"
+    master_node: "k8s-dmz-control-0"
+    manifests:
+      - "keepalived.yaml"
+      - "haproxy.yaml"
+
+  tasks:
+    - name: Check if cluster was initiated already
+      ansible.builtin.stat:
+        path: "/etc/kubernetes/pki/ca.key"
+      register: k8s_initiated
+
+    - name: Init cluster if necessary
+      when: not k8s_initiated.stat.exists
+      block:
+        - name: Reset cluster
+          become: true
+          ansible.builtin.shell: "kubeadm reset --force --cri-socket=unix:///var/run/cri-dockerd.sock"
+
+        - name: Create kubernetes manifests
+          become: true
+          ansible.builtin.copy:
+            src: "k8s/{{ item }}"
+            dest: "/etc/kubernetes/manifests/{{ item }}"
+            owner: root
+            group: root
+            mode: "0600"
+          loop: "{{ manifests }}"
+
+        - name: Initiate cluster
+          become: true
+          ansible.builtin.shell: "kubeadm init --control-plane-endpoint vip.dmzcluster.local \
+                                                --pod-network-cidr {{ pod_network_cidr }} \
+                                                --cri-socket=unix:///var/run/cri-dockerd.sock \
+                                                --upload-certs \
+                                                --token {{ token }}"
+          register: ca_cert_output
+
+        - name: Copy ca-cert-hash to file
+          become: true
+          ansible.builtin.template:
+            src: k8s/ca-cert-key.txt.j2
+            dest: /root/ca-cert-hash.txt
+
+        - name: Create kubeconfig folder
+          ansible.builtin.file:
+            path: "{{ ansible_user }}/.kube"
+            state: directory
+            owner: "{{ ansible_user }}"
+            group: "{{ ansible_user }}"
+            mode: "0755"
+
+        - name: Copy standard config
+          become: true
+          ansible.builtin.copy:
+            remote_src: true
+            src: /etc/kubernetes/admin.conf
+            dest: "/home/{{ ansible_user }}/.kube/config"
+            owner: "{{ ansible_user }}"
+            group: "{{ ansible_user }}"
+
+        - name: Install network addon
+          ansible.builtin.shell: "kubectl apply -f {{ network_addon }}"
+
+
+- name: Master preparation
+  hosts: master
+  become: true
+
+  tasks:
+  - name: Re-Upload certs
+    ansible.builtin.shell: "kubeadm init phase upload-certs --upload-certs"
+    register: CERT
+
+  - name: Generate CA_KEY_HASH
+    ansible.builtin.shell: "openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed 's/^.* //'"
+    register: CA_KEY_HASH
+
+  - name: Save certs to localhost
+    become: false
+    ansible.builtin.copy:
+      content: "---\nCA_KEY_HASH: 'sha256:{{ CA_KEY_HASH.stdout }}'\nCERT: '{{ CERT.stdout_lines[-1] }}'\n"
+      dest: /tmp/k8s_certs.yaml
+    delegate_to: localhost
+
+  - name: Fetch kube config
+    ansible.builtin.fetch:
+      src: /home/ansible/.kube/config
+      dest: /tmp/config
+
+
+- name: Join Control Nodes
+  hosts: control
+  become: true
+  vars_files:
+    - /tmp/k8s_certs.yaml
+  vars:
+    manifests:
+      - "keepalived.yaml"
+      - "haproxy.yaml"
+
+  tasks:
+    - name: Check if cluster was initiated already
+      ansible.builtin.stat:
+        path: "/etc/kubernetes/pki/ca.key"
+      register: k8s_initiated
+
+    - name: Get Nodes from Master
+      ansible.builtin.shell: "ssh ansible@{{ hostvars[groups['master'][0]].ansible_host }} -i ansible 'kubectl get nodes'"
+      delegate_to: localhost
+      become: false
+      register: KUBECTL_GET_NODES
+
+    - name: Join Node if necesssary
+      when: "not k8s_initiated.stat.exists or KUBECTL_GET_NODES.stdout_lines | select('match', ansible_facts.nodename) | join | regex_search('NotReady') is not none"
+      block:
+        - name: Gracefully remove Node from Cluster
+          ansible.builtin.shell: "ssh ansible@{{ hostvars[groups['master'][0]].ansible_host }} -i ansible 'kubectl drain {{ ansible_facts.nodename }} && sleep 10 && kubectl delete node {{ ansible_facts.nodename }}'"
+          delegate_to: localhost
+          become: false
+
+      rescue:
+        - name: Forcefully remove Node from Cluster
+          ansible.builtin.shell: "ssh ansible@{{ hostvars[groups['master'][0]].ansible_host }} -i ansible 'kubectl cordon {{ ansible_facts.nodename }} && kubectl drain {{ ansible_facts.nodename }} --force --ignore-daemonsets && sleep 10 && kubectl delete node {{ ansible_facts.nodename }}'"
+          delegate_to: localhost
+          ignore_errors: true
+          become: false
+
+      always:
+        - name: Reset cluster
+          ansible.builtin.shell: "kubeadm reset --force --cri-socket=unix:///var/run/cri-dockerd.sock"
+
+        - name: Create kubernetes manifests
+          become: true
+          ansible.builtin.copy:
+            src: "k8s/{{ item }}"
+            dest: "/etc/kubernetes/manifests/{{ item }}"
+            owner: root
+            group: root
+            mode: "0600"
+          loop: "{{ manifests }}"
+
+        - name: Join Node
+          ansible.builtin.shell: "kubeadm join vip.dmzcluster.local:8443 \
+                                                --token {{ token }} \
+                                                --discovery-token-ca-cert-hash {{ CA_KEY_HASH }} \
+                                                --control-plane \
+                                                --certificate-key {{ CERT }} \
+                                                --cri-socket=unix:///var/run/cri-dockerd.sock"
+
+        - name: Copy kube config
+          ansible.builtin.copy:
+            src: /etc/kubernetes/admin.conf
+            dest: /home/ansible/.kube/config
+            remote_src: true
+            owner: ansible
+            group: ansible
+            mode: "0600"
+
+        - name: Rebalance CoreDNS
+          ansible.builtin.shell: "kubectl -n kube-system rollout restart deployment coredns"
+
+
+- name: Join Worker Nodes
+  hosts: worker
+  become: true
+  vars_files:
+    - /tmp/k8s_certs.yaml
+
+  tasks:
+    - name: Check if cluster was initiated already
+      ansible.builtin.stat:
+        path: "/etc/kubernetes/pki/ca.key"
+      register: k8s_initiated
+
+    - name: Get Nodes from Master
+      ansible.builtin.shell: "ssh ansible@{{ hostvars[groups['master'][0]].ansible_host }} -i ansible 'kubectl get nodes'"
+      delegate_to: localhost
+      become: false
+      register: KUBECTL_GET_NODES
+
+    - name: Joind Node if necessary
+      when: "not k8s_initiated.stat.exists or KUBECTL_GET_NODES.stdout_lines | select('match', ansible_facts.nodename) | join | regex_search('NotReady') is not none"
+      block:
+        - name: Gracefully remove Node from Cluster
+          ansible.builtin.shell: "ssh ansible@{{ hostvars[groups['master'][0]].ansible_host }} -i ansible 'kubectl drain {{ ansible_facts.nodename }} && sleep 10 && kubectl delete node {{ ansible_facts.nodename }}'"
+          delegate_to: localhost
+          become: false
+
+      rescue:
+        - name: Forcefully remove Node from Cluster
+          ansible.builtin.shell: "ssh ansible@{{ hostvars[groups['master'][0]].ansible_host }} -i ansible 'kubectl cordon {{ ansible_facts.nodename }} && kubectl drain {{ ansible_facts.nodename }} --force --ignore-daemonsets && sleep 10 && kubectl delete node {{ ansible_facts.nodename }}'"
+          delegate_to: localhost
+          ignore_errors: true
+          become: false
+
+      always:
+        - name: Reset cluster
+          ansible.builtin.shell: "kubeadm reset --force --cri-socket=unix:///var/run/cri-dockerd.sock"
+
+        - name: Join Node
+          ansible.builtin.shell: "kubeadm join vip.dmzcluster.local:8443 \
+                                                --token {{ token }} \
+                                                --discovery-token-ca-cert-hash {{ CA_KEY_HASH }} \
+                                                --cri-socket=unix:///var/run/cri-dockerd.sock"
