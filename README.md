@@ -10,6 +10,6 @@ My current implementation of the Kubernetes cluster is running onpremises on a s
 Running the playbook again does not change any configuration on the existing Nodes.
 
 # Things to improve
-I learned that the roles feature of Ansible is the better fit for this purpose, so if I have time I will rewrite the project using these.
-
-Currently there is no implementation for removing a Node completely.
+- [ ] I learned that the roles feature of Ansible is the better fit for this purpose, so if I have time I will rewrite the project using these.
+- [ ] Currently there is no implementation for removing a Node completely.
+- [ ] The hostfile is currently not filled by the inventory, but the variabels specified on top
